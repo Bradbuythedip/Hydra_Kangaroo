@@ -6,13 +6,17 @@ Targets Bitcoin Puzzle #135 (private key in range [2^134, 2^135)).
 
 ## What This Is
 
-A CUDA implementation of Pollard's kangaroo algorithm that combines three key optimizations to achieve **15-25x throughput** over standard GPU kangaroo implementations:
+A CUDA implementation of Pollard's kangaroo algorithm that combines five key optimizations to maximize throughput per GPU:
 
-1. **Batch Inversion (10-15x)** -- Each thread manages K=32 kangaroos simultaneously, amortizing one expensive modular inversion across all 32 using Montgomery's trick. This reduces per-step cost from 268 field multiplications to ~25.
+1. **Batch Inversion (10-15x)** -- Each thread manages K=32 kangaroos simultaneously, amortizing one expensive modular inversion across all 32 using Montgomery's trick. Reduces per-step cost from 268 to ~25 field multiplications.
 
-2. **Z=1 Specialized EC Addition (1.5x)** -- After batch-to-affine conversion, the next EC add is affine+affine, costing 4M+2S instead of the generic 7M+4S mixed addition.
+2. **Z=1 Specialized EC Addition (1.5x)** -- After batch-to-affine conversion, the next EC add is affine+affine, costing 4M+2S instead of 7M+4S.
 
-3. **Galbraith-Ruprai Equivalence Classes (2.45x effective)** -- secp256k1's endomorphism maps each point to 6 equivalents via {P, lambda*P, lambda^2*P, -P, -lambda*P, -lambda^2*P}. By canonicalizing to the representative with smallest x-coordinate, each step effectively covers 6 group elements, giving sqrt(6) ~ 2.45x speedup vs naive (sqrt(2) improvement over endomorphism-only).
+3. **Galbraith-Ruprai Equivalence Classes (2.45x effective)** -- secp256k1's endomorphism maps each point to 6 equivalents. Canonicalization to minimum x gives sqrt(6) ~ 2.45x speedup vs naive.
+
+4. **L2-Resident Bloom Filter** -- On-GPU bloom filter for DP pre-matching eliminates PCIe round-trips for 99.9%+ of wild DP checks. Only bloom-positive candidates go to host.
+
+5. **Multi-GPU Support** -- Native multi-GPU with `--gpus N`. Each GPU runs independent kangaroo walks with per-GPU bloom filters, sharing a single host DP table via mutex-protected hash map.
 
 ### Per-Step Cost Breakdown
 
@@ -37,7 +41,10 @@ make test           # Run field arithmetic + EC tests
 ## Run
 
 ```bash
-./build/hydra [--dp-bits 25] [--blocks 2048]
+./build/hydra                          # Single GPU, defaults
+./build/hydra --gpus 4                 # 4 GPUs
+./build/hydra --gpus 16 --blocks 4096  # 16 GPUs, more blocks
+./build/hydra --dp-bits 28 --gpus 8    # Larger DP window for bigger searches
 ```
 
 ## Architecture
@@ -48,7 +55,7 @@ include/
   ec.cuh       -- EC point arithmetic (Jacobian double, mixed add, Z=1 add, batch affine,
                   endomorphism, Galbraith-Ruprai canonicalization)
 src/
-  hydra_kangaroo.cu  -- Main solver kernel + host coordinator
+  hydra_kangaroo.cu  -- Main solver kernel + bloom filter + multi-GPU coordinator
 tests/
   test_field.cu      -- GPU unit tests for field and EC operations
 scripts/
@@ -162,10 +169,11 @@ The Python prototype (`scripts/kangaroo.py`) has been verified against puzzles #
 - [x] Kernel with batch inversion (K=32 kangaroos per thread)
 - [x] Host-side DP collision detection with full x-coordinate matching
 - [x] Key recovery with verification
+- [x] L2-resident bloom filter for on-GPU DP pre-matching
+- [x] Multi-GPU support (--gpus N)
 - [x] Test suite
 - [ ] GPU benchmarking on real hardware
-- [ ] L2 bloom filter for on-GPU DP matching
-- [ ] Distributed mode (multi-machine)
+- [ ] Distributed mode (multi-machine TCP server/client)
 - [ ] Multi-target mode (solve multiple puzzles simultaneously)
 
 ## License
