@@ -101,6 +101,13 @@ typedef struct {
 __constant__ AffinePoint c_jump_points[NUM_JUMPS];
 __constant__ u256 c_jump_scalars[NUM_JUMPS];
 
+// Escape jump table: large jumps for loop detection escape
+// When the negation map creates a 2-cycle, kangaroos use these
+// to break out. Sized ~2^(range/2) to maintain good mixing.
+#define NUM_ESCAPE_JUMPS 32
+__constant__ AffinePoint c_escape_points[NUM_ESCAPE_JUMPS];
+__constant__ u256 c_escape_scalars[NUM_ESCAPE_JUMPS];
+
 // ═══════════════════════════════════════════════════════════════
 // KANGAROO STATE
 // ═══════════════════════════════════════════════════════════════
@@ -151,17 +158,20 @@ bool bloom_check(const uint32_t *bloom, const u256 *x) {
 //
 // Architecture: each thread manages K=32 kangaroos.
 // Per step:
-//   1. Canonicalize x-coordinates (2M each) — CACHED for reuse
-//   2. Z=1 mixed add for each kangaroo (4M + 2S each)
-//   3. Batch-invert all K Z-values (1 inv + 3K muls)
-//   4. Convert to affine (3M each)
-//   5. DP check using cached canonical x (0M — already computed!)
+//   1. Select jump based on x-coordinate
+//   2. Check y-parity: even → add jump, odd → subtract jump (NEGATION MAP)
+//   3. Z=1 mixed add for each kangaroo (4M + 2S each)
+//   4. Batch-invert all K Z-values (1 inv + 3K muls)
+//   5. Convert to affine (3M each)
+//   6. Loop detection: if same jump index repeated, use escape jump
+//   7. DP check + bloom filter
 //
-// Key optimization vs prior version: canonicalization computed ONCE
-// per step, not twice. Saves 2M * K = 64M per step.
+// The negation map (step 2) makes the walk operate on {P, -P}
+// equivalence classes, doubling coverage → sqrt(2) speedup.
+// Combined with Galbraith-Ruprai endomorphism → sqrt(6) total.
 //
-// Cost: ~18.5 mul-equivalents per step (vs 268 standard)
-// With sqrt(6) equivalence: ~35x effective speedup
+// ALL JUMP DISTANCES MUST BE EVEN for correct key recovery with
+// the negation map (wild-wild collisions may require division by 2).
 // ═══════════════════════════════════════════════════════════════
 
 __global__ void kangaroo_batch_walk(
@@ -176,10 +186,11 @@ __global__ void kangaroo_batch_walk(
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t base = tid * KANGAROOS_PER_THREAD;
 
-    // Load state into registers: affine points (Z=1 after init/previous kernel)
+    // Load state into registers
     AffinePoint aff[KANGAROOS_PER_THREAD];
     u256 dist[KANGAROOS_PER_THREAD];
     uint32_t type[KANGAROOS_PER_THREAD];
+    uint8_t last_jump[KANGAROOS_PER_THREAD];  // Loop detection: previous jump index
 
     #pragma unroll
     for (int k = 0; k < KANGAROOS_PER_THREAD; k++) {
@@ -188,28 +199,54 @@ __global__ void kangaroo_batch_walk(
         aff[k].y = jp.Y;
         dist[k] = states[base + k].walk_dist;
         type[k] = states[base + k].type;
+        last_jump[k] = 0xFF;  // No previous jump
     }
 
     for (uint32_t step = 0; step < steps; step++) {
 
-        // ─── Phase 1: Canonicalize + Z=1 Mixed Add (2M + 4M + 2S per kangaroo) ───
+        // ─── Phase 1: Jump selection + Negation map + EC add ───
         JacobianPoint pos[KANGAROOS_PER_THREAD];
-        // Cache canonical x for reuse in DP check (eliminates redundant 2M*K)
-        u256 cached_canon_x[KANGAROOS_PER_THREAD];
 
         #pragma unroll
         for (int k = 0; k < KANGAROOS_PER_THREAD; k++) {
+            // Select jump based on x-coordinate (same for P and -P)
 #if ENABLE_GALBRAITH_RUPRAI
             int lambda_exp;
-            cached_canon_x[k] = ec_canonicalize_x(&aff[k].x, &lambda_exp);
-            uint32_t j = cached_canon_x[k].d[0] & (NUM_JUMPS - 1);
+            u256 canon_x = ec_canonicalize_x(&aff[k].x, &lambda_exp);
+            uint32_t j = canon_x.d[0] & (NUM_JUMPS - 1);
 #else
             uint32_t j = aff[k].x.d[0] & (NUM_JUMPS - 1);
 #endif
-            pos[k] = ec_add_mixed_z1(&aff[k], &c_jump_points[j]);
 
-            uint32_t carry;
-            dist[k] = u256_add_cc(&dist[k], &c_jump_scalars[j], &carry);
+            // Loop detection: if same jump index as last step, use escape jump
+            bool is_loop = (j == last_jump[k]);
+            last_jump[k] = (uint8_t)j;
+
+            if (__builtin_expect(is_loop, 0)) {
+                // Escape: use large random jump from escape table
+                uint32_t ej = (aff[k].x.d[1] ^ step) & (NUM_ESCAPE_JUMPS - 1);
+                pos[k] = ec_add_mixed_z1(&aff[k], &c_escape_points[ej]);
+                uint32_t carry;
+                dist[k] = u256_add_cc(&dist[k], &c_escape_scalars[ej], &carry);
+            } else {
+                // Negation map: check y-parity to decide add vs subtract
+                bool y_odd = (aff[k].y.d[0] & 1);
+
+                if (!y_odd) {
+                    // y is even: ADD the jump (normal)
+                    pos[k] = ec_add_mixed_z1(&aff[k], &c_jump_points[j]);
+                    uint32_t carry;
+                    dist[k] = u256_add_cc(&dist[k], &c_jump_scalars[j], &carry);
+                } else {
+                    // y is odd: SUBTRACT the jump (negate jump point's y)
+                    AffinePoint neg_jump;
+                    neg_jump.x = c_jump_points[j].x;
+                    neg_jump.y = fp_neg(&c_jump_points[j].y);
+                    pos[k] = ec_add_mixed_z1(&aff[k], &neg_jump);
+                    uint32_t borrow;
+                    dist[k] = u256_sub_borrow(&dist[k], &c_jump_scalars[j], &borrow);
+                }
+            }
         }
 
         // ─── Phase 2: Batch convert to affine (1 inv + 3K muls) ───
@@ -538,13 +575,45 @@ void generate_jump_table(AffinePoint *h_jumps, u256 *h_scalars, int range_bits) 
             h_scalars[i].d[0] ^= (uint64_t)rand() << 32 | (uint64_t)rand();
         }
 
+        // Negation map requires ALL jump distances to be EVEN
+        // (so adding/subtracting preserves parity of walk distance)
+        h_scalars[i].d[0] &= 0xFFFFFFFFFFFFFFFEULL;
+
         // Compute jump point = scalar * G
         JacobianPoint jp = h_ec_scalar_mul(&h_scalars[i], &GENERATOR);
         h_jumps[i] = h_ec_to_affine(&jp);
 
         if (i % 64 == 0) printf("    jump[%d/%d] done\n", i, NUM_JUMPS);
     }
-    printf("  Jump table ready.\n");
+    printf("  Jump table ready (all distances even for negation map).\n");
+}
+
+void generate_escape_table(AffinePoint *h_jumps, u256 *h_scalars, int range_bits) {
+    int mean_bits = (range_bits / 2) - 10;  // Slightly smaller than main jumps
+    if (mean_bits < 10) mean_bits = 10;
+    srand(1337);  // Different seed from main jump table
+
+    printf("  Generating escape table (%d entries, mean ~2^%d)...\n",
+           NUM_ESCAPE_JUMPS, mean_bits);
+
+    for (int i = 0; i < NUM_ESCAPE_JUMPS; i++) {
+        int bits = mean_bits - 2 + (i % 5);
+        if (bits < 1) bits = 1;
+
+        memset(&h_scalars[i], 0, sizeof(u256));
+        h_scalars[i].d[bits / 64] = 1ULL << (bits % 64);
+
+        if (bits > 8) {
+            h_scalars[i].d[0] ^= (uint64_t)rand() << 32 | (uint64_t)rand();
+        }
+
+        // Escape jumps must also be even (negation map consistency)
+        h_scalars[i].d[0] &= 0xFFFFFFFFFFFFFFFEULL;
+
+        JacobianPoint jp = h_ec_scalar_mul(&h_scalars[i], &GENERATOR);
+        h_jumps[i] = h_ec_to_affine(&jp);
+    }
+    printf("  Escape table ready.\n");
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -765,6 +834,8 @@ struct GPUWorker {
     int range_bits;
     AffinePoint *h_jumps;
     u256 *h_scalars;
+    AffinePoint *h_escape_jumps;
+    u256 *h_escape_scalars;
 
     KangarooState *d_states;
     DPEntry *d_dps;
@@ -800,6 +871,8 @@ void *gpu_worker_thread(void *arg) {
 
     cudaMemcpyToSymbol(c_jump_points, w->h_jumps, NUM_JUMPS * sizeof(AffinePoint));
     cudaMemcpyToSymbol(c_jump_scalars, w->h_scalars, NUM_JUMPS * sizeof(u256));
+    cudaMemcpyToSymbol(c_escape_points, w->h_escape_jumps, NUM_ESCAPE_JUMPS * sizeof(AffinePoint));
+    cudaMemcpyToSymbol(c_escape_scalars, w->h_escape_scalars, NUM_ESCAPE_JUMPS * sizeof(u256));
 
     KangarooState *h_states = (KangarooState *)malloc(total_kangaroos * sizeof(KangarooState));
     srand(12345 + w->gpu_id * 1000000);
@@ -1013,6 +1086,11 @@ int main(int argc, char **argv) {
     u256 *h_scalars = (u256 *)malloc(NUM_JUMPS * sizeof(u256));
     generate_jump_table(h_jumps, h_scalars, range_bits);
 
+    // Generate escape table for loop detection (negation map)
+    AffinePoint *h_escape_jumps = (AffinePoint *)malloc(NUM_ESCAPE_JUMPS * sizeof(AffinePoint));
+    u256 *h_escape_scalars = (u256 *)malloc(NUM_ESCAPE_JUMPS * sizeof(u256));
+    generate_escape_table(h_escape_jumps, h_escape_scalars, range_bits);
+
     // Launch multi-GPU workers
     GPUWorker *workers = (GPUWorker *)calloc(num_gpus, sizeof(GPUWorker));
     pthread_t *threads = (pthread_t *)malloc(num_gpus * sizeof(pthread_t));
@@ -1024,6 +1102,8 @@ int main(int argc, char **argv) {
         workers[g].range_bits = range_bits;
         workers[g].h_jumps = h_jumps;
         workers[g].h_scalars = h_scalars;
+        workers[g].h_escape_jumps = h_escape_jumps;
+        workers[g].h_escape_scalars = h_escape_scalars;
         workers[g].steps_done = 0;
         workers[g].dps_found = 0;
     }
@@ -1100,6 +1180,8 @@ int main(int argc, char **argv) {
 
     free(h_jumps);
     free(h_scalars);
+    free(h_escape_jumps);
+    free(h_escape_scalars);
     free(workers);
     free(threads);
 
