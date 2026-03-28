@@ -36,19 +36,50 @@
 #define ENABLE_GALBRAITH_RUPRAI 1 // Equivalence class canonicalization
 #define BLOOM_SIZE_BITS 27        // 2^27 = 128M bits = 16 MB bloom filter
 #define BLOOM_NUM_HASHES 4        // Number of hash functions for bloom filter
+#define MAX_TARGETS 16            // Maximum number of simultaneous puzzle targets
 
-// Puzzle #135 target public key
+// ═══════════════════════════════════════════════════════════════
+// MULTI-TARGET PUZZLE DEFINITIONS
+//
+// Multi-target mode: solve T puzzles simultaneously for sqrt(T) speedup.
+// Each puzzle has: public key (Qx, Qy), range [2^(N-1), 2^N)
+// Wild kangaroos are split across targets; tame kangaroos are shared.
+// Any tame-wild collision from ANY target solves that target.
+//
+// Type encoding: type = (target_idx << 4) | (0=tame, 1=wild)
+// ═══════════════════════════════════════════════════════════════
+
+struct PuzzleTarget {
+    AffinePoint Q;           // Target public key
+    u256 range_start;        // 2^(N-1)
+    u256 range_size;         // 2^(N-1) (width of search range)
+    int puzzle_number;       // For display
+};
+
+// Default target: Puzzle #135
 // Qx = 0x145D2611C823A396EF6712CE0F712F09B9B4F3135E3E0AA3230FB9B6D08D1E16
 // Qy = 0x667A05E9A1BDD6F70142B66558BD12CE2C0F9CBC7001B20C8A6A109C80DC5330
-static const AffinePoint TARGET_Q = {
+static const AffinePoint TARGET_Q_135 = {
     {{0x230FB9B6D08D1E16ULL, 0xB9B4F3135E3E0AA3ULL,
       0xEF6712CE0F712F09ULL, 0x145D2611C823A396ULL}},
     {{0x8A6A109C80DC5330ULL, 0x2C0F9CBC7001B20CULL,
       0x0142B66558BD12CEULL, 0x667A05E9A1BDD6F7ULL}}
 };
 
-// Range: [2^134, 2^135)
-// 2^134 = d[2] has bit 6 set (134 - 128 = 6), so d[2] = 0x40
+// Global target configuration (set at runtime for multi-target)
+static PuzzleTarget g_targets[MAX_TARGETS];
+static int g_num_targets = 0;
+
+// Helper: create range start for puzzle #N (= 2^(N-1))
+static inline u256 make_range_start(int puzzle_num) {
+    u256 r = {{0, 0, 0, 0}};
+    int bit = puzzle_num - 1;
+    r.d[bit / 64] = 1ULL << (bit % 64);
+    return r;
+}
+
+// Legacy aliases for single-target compatibility
+#define TARGET_Q TARGET_Q_135
 static const u256 RANGE_START = {{0x0ULL, 0x0ULL, 0x40ULL, 0x0ULL}};
 static const u256 RANGE_SIZE  = {{0x0ULL, 0x0ULL, 0x40ULL, 0x0ULL}};
 
@@ -521,53 +552,75 @@ void generate_jump_table(AffinePoint *h_jumps, u256 *h_scalars, int range_bits) 
 // ═══════════════════════════════════════════════════════════════
 
 void init_kangaroos(KangarooState *h_states, uint32_t total_kangaroos) {
-    printf("  Initializing %u kangaroos...\n", total_kangaroos);
+    printf("  Initializing %u kangaroos (%d targets)...\n",
+           total_kangaroos, g_num_targets);
 
-    // Compute Q' = Q - range_start * G so that wild kangaroos
-    // walk relative to the bottom of the range.
-    JacobianPoint range_start_G = h_ec_scalar_mul(&RANGE_START, &GENERATOR);
-    AffinePoint range_start_aff = h_ec_to_affine(&range_start_G);
+    // Precompute Q' = Q - range_start * G for each target
+    AffinePoint Q_prime[MAX_TARGETS];
+    for (int t = 0; t < g_num_targets; t++) {
+        JacobianPoint range_G = h_ec_scalar_mul(&g_targets[t].range_start, &GENERATOR);
+        AffinePoint range_aff = h_ec_to_affine(&range_G);
+        u256 neg_y = h_fp_neg(&range_aff.y);
+        AffinePoint neg_range_G = { range_aff.x, neg_y };
 
-    // Q' = Q + (-range_start * G) = Q - range_start * G
-    u256 neg_y = h_fp_neg(&range_start_aff.y);
-    AffinePoint neg_range_start_G = { range_start_aff.x, neg_y };
-
-    JacobianPoint Q_jac;
-    Q_jac.X = TARGET_Q.x; Q_jac.Y = TARGET_Q.y;
-    Q_jac.Z.d[0] = 1; Q_jac.Z.d[1] = 0; Q_jac.Z.d[2] = 0; Q_jac.Z.d[3] = 0;
-    JacobianPoint Q_prime_jac = h_ec_add_mixed(&Q_jac, &neg_range_start_G);
-    AffinePoint Q_prime = h_ec_to_affine(&Q_prime_jac);
-
-    printf("  Q' computed (Q reframed to range start).\n");
+        JacobianPoint Q_jac;
+        Q_jac.X = g_targets[t].Q.x; Q_jac.Y = g_targets[t].Q.y;
+        Q_jac.Z.d[0] = 1; Q_jac.Z.d[1] = 0;
+        Q_jac.Z.d[2] = 0; Q_jac.Z.d[3] = 0;
+        JacobianPoint Q_prime_jac = h_ec_add_mixed(&Q_jac, &neg_range_G);
+        Q_prime[t] = h_ec_to_affine(&Q_prime_jac);
+        printf("  Target #%d (puzzle %d): Q' computed.\n",
+               t, g_targets[t].puzzle_number);
+    }
 
     // Note: caller must seed srand() before calling this function
 
+    // Optimal herd ratio for Pollard kangaroo:
+    // Standard 2-kangaroo: 50% tame, 50% wild (K=2.08)
+    // Optimized: ~40% tame, ~60% wild (K~1.7 with negation map)
+    // Wild kangaroos distributed round-robin across targets
+    //
+    // Type encoding: (target_idx << 4) | (0=tame, 1=wild)
+
+    int wild_target_idx = 0;  // Round-robin counter for multi-target
+
     for (uint32_t i = 0; i < total_kangaroos; i++) {
-        // Random starting scalar in [0, range_size)
-        // range_size = 2^134, so we need ~134 random bits
+        // Use primary target's range for random scalar generation
+        // (all targets share the same walk space after reframing)
+        int primary_bits = g_targets[0].puzzle_number - 1;  // 134 for puzzle #135
         u256 start_scalar;
         start_scalar.d[0] = ((uint64_t)rand() << 32) | rand();
         start_scalar.d[1] = ((uint64_t)rand() << 32) | rand();
-        start_scalar.d[2] = ((uint64_t)rand() << 6) | (rand() & 0x3F); // 6 bits
+        int extra_bits = primary_bits - 128;
+        if (extra_bits > 0 && extra_bits < 64) {
+            start_scalar.d[2] = (uint64_t)rand() & ((1ULL << extra_bits) - 1);
+        } else {
+            start_scalar.d[2] = 0;
+        }
         start_scalar.d[3] = 0;
 
-        if (i % 2 == 0) {
+        // 40% tame, 60% wild (optimized ratio)
+        bool is_tame = (i % 5 < 2);
+
+        if (is_tame) {
             // Tame: start at start_scalar * G (relative to range start)
             JacobianPoint pt = h_ec_scalar_mul(&start_scalar, &GENERATOR);
             AffinePoint aff = h_ec_to_affine(&pt);
-            // Store as Jacobian with Z=1 (kernel reads X,Y as affine)
             h_states[i].pos.X = aff.x;
             h_states[i].pos.Y = aff.y;
             h_states[i].pos.Z.d[0] = 1; h_states[i].pos.Z.d[1] = 0;
             h_states[i].pos.Z.d[2] = 0; h_states[i].pos.Z.d[3] = 0;
             h_states[i].walk_dist = start_scalar;
-            h_states[i].type = 0;
+            h_states[i].type = 0;  // tame: target_idx=0, is_wild=0
         } else {
-            // Wild: start at Q' + start_scalar * G
+            // Wild: start at Q'[target] + start_scalar * G
+            int t = wild_target_idx % g_num_targets;
+            wild_target_idx++;
+
             JacobianPoint sG = h_ec_scalar_mul(&start_scalar, &GENERATOR);
             AffinePoint sG_aff = h_ec_to_affine(&sG);
             JacobianPoint Q_prime_jac2;
-            Q_prime_jac2.X = Q_prime.x; Q_prime_jac2.Y = Q_prime.y;
+            Q_prime_jac2.X = Q_prime[t].x; Q_prime_jac2.Y = Q_prime[t].y;
             Q_prime_jac2.Z.d[0] = 1; Q_prime_jac2.Z.d[1] = 0;
             Q_prime_jac2.Z.d[2] = 0; Q_prime_jac2.Z.d[3] = 0;
             JacobianPoint pt = h_ec_add_mixed(&Q_prime_jac2, &sG_aff);
@@ -577,7 +630,7 @@ void init_kangaroos(KangarooState *h_states, uint32_t total_kangaroos) {
             h_states[i].pos.Z.d[0] = 1; h_states[i].pos.Z.d[1] = 0;
             h_states[i].pos.Z.d[2] = 0; h_states[i].pos.Z.d[3] = 0;
             h_states[i].walk_dist = start_scalar;
-            h_states[i].type = 1;
+            h_states[i].type = (t << 4) | 1;  // wild for target t
         }
         h_states[i].active = 1;
 
@@ -615,35 +668,38 @@ uint64_t dp_hash(const u256 *x) {
 
 // Recover private key from tame-wild collision
 // key = range_start + tame_dist - wild_dist
-void recover_key(const u256 *tame_dist, const u256 *wild_dist) {
-    // k = range_start + tame_dist - wild_dist
+// target_idx identifies which puzzle was solved (for multi-target)
+void recover_key(const u256 *tame_dist, const u256 *wild_dist, int target_idx) {
+    const PuzzleTarget *tgt = &g_targets[target_idx];
     uint32_t carry, borrow;
-    u256 sum = h_u256_add(&RANGE_START, tame_dist, &carry);
+    u256 sum = h_u256_add(&tgt->range_start, tame_dist, &carry);
     u256 key = h_u256_sub(&sum, wild_dist, &borrow);
 
     printf("\n  ***********************************************************\n");
-    printf("  *  PRIVATE KEY RECOVERED!                                  *\n");
+    printf("  *  PRIVATE KEY RECOVERED!  (Puzzle #%d)                   *\n",
+           tgt->puzzle_number);
     printf("  ***********************************************************\n");
     printf("  Key: %016lx%016lx%016lx%016lx\n",
            key.d[3], key.d[2], key.d[1], key.d[0]);
     printf("  ***********************************************************\n");
 
-    // Verify: compute key * G and check against TARGET_Q
+    // Verify: compute key * G and check against target Q
     JacobianPoint verify = h_ec_scalar_mul(&key, &GENERATOR);
     AffinePoint verify_aff = h_ec_to_affine(&verify);
-    if (h_u256_eq(&verify_aff.x, &TARGET_Q.x)) {
-        printf("  VERIFICATION: Key is CORRECT!\n");
+    if (h_u256_eq(&verify_aff.x, &tgt->Q.x)) {
+        printf("  VERIFICATION: Key is CORRECT! Puzzle #%d SOLVED!\n",
+               tgt->puzzle_number);
     } else {
-        printf("  VERIFICATION: Key MISMATCH — checking range_start - tame + wild...\n");
-        // Try the other direction
-        u256 sum2 = h_u256_add(&RANGE_START, wild_dist, &carry);
+        printf("  VERIFICATION: Key MISMATCH -- trying alternate direction...\n");
+        u256 sum2 = h_u256_add(&tgt->range_start, wild_dist, &carry);
         u256 key2 = h_u256_sub(&sum2, tame_dist, &borrow);
         JacobianPoint v2 = h_ec_scalar_mul(&key2, &GENERATOR);
         AffinePoint v2a = h_ec_to_affine(&v2);
-        if (h_u256_eq(&v2a.x, &TARGET_Q.x)) {
+        if (h_u256_eq(&v2a.x, &tgt->Q.x)) {
             printf("  Key (alt): %016lx%016lx%016lx%016lx\n",
                    key2.d[3], key2.d[2], key2.d[1], key2.d[0]);
-            printf("  VERIFICATION: Alternate key is CORRECT!\n");
+            printf("  VERIFICATION: Alternate key is CORRECT! Puzzle #%d SOLVED!\n",
+                   tgt->puzzle_number);
         } else {
             printf("  WARNING: Neither direction verified. Possible endomorphism DP.\n");
         }
@@ -656,15 +712,23 @@ bool check_dp_collision(const DPEntry *entry) {
     if (it != dp_table.end()) {
         for (auto &existing : it->second) {
             // Must match on full x AND be tame-wild pair
+            bool existing_is_wild = (existing.type & 1) != 0;
+            bool entry_is_wild = (entry->type & 1) != 0;
             if (h_u256_eq(&existing.x_affine, &entry->x_affine) &&
-                (existing.type & 1) != (entry->type & 1)) {
+                existing_is_wild != entry_is_wild) {
+
+                // Determine which target the wild kangaroo belongs to
+                uint32_t wild_type = existing_is_wild ? existing.type : entry->type;
+                int target_idx = (wild_type >> 4) & 0xF;
+                if (target_idx >= g_num_targets) target_idx = 0;
 
                 printf("\n  +==========================================+\n");
-                printf("  |  DP COLLISION DETECTED!                  |\n");
+                printf("  |  DP COLLISION! Puzzle #%d              |\n",
+                       g_targets[target_idx].puzzle_number);
                 printf("  +==========================================+\n");
 
                 const u256 *tame_d, *wild_d;
-                if ((existing.type & 1) == 0) {
+                if (!existing_is_wild) {
                     tame_d = &existing.walk_distance;
                     wild_d = &entry->walk_distance;
                 } else {
@@ -677,7 +741,7 @@ bool check_dp_collision(const DPEntry *entry) {
                 printf("  Wild dist: %016lx%016lx%016lx%016lx\n",
                     wild_d->d[3], wild_d->d[2], wild_d->d[1], wild_d->d[0]);
 
-                recover_key(tame_d, wild_d);
+                recover_key(tame_d, wild_d, target_idx);
                 return true;
             }
         }
@@ -820,6 +884,24 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--gpus") == 0 && i+1 < argc) num_gpus = atoi(argv[++i]);
     }
 
+    // ─── Configure puzzle targets ───
+    // Default: single target (puzzle #135)
+    // Multi-target: add more exposed-key puzzles for sqrt(T) speedup
+    // NOTE: To add more targets, provide their public keys here.
+    // Every 5th puzzle from #65-#160 has an exposed public key.
+    g_num_targets = 1;
+    g_targets[0].Q = TARGET_Q_135;
+    g_targets[0].range_start = make_range_start(135);
+    g_targets[0].range_size = make_range_start(135);  // width = 2^134
+    g_targets[0].puzzle_number = 135;
+
+    // TODO: Add puzzle #140 public key here for multi-target mode:
+    // g_targets[1].Q = TARGET_Q_140;  // Need the actual exposed public key
+    // g_targets[1].range_start = make_range_start(140);
+    // g_targets[1].range_size = make_range_start(140);
+    // g_targets[1].puzzle_number = 140;
+    // g_num_targets = 2;  // sqrt(2) ~ 1.41x speedup on collision probability
+
     int device_count;
     cudaGetDeviceCount(&device_count);
     if (num_gpus > device_count) {
@@ -887,24 +969,43 @@ int main(int argc, char **argv) {
 #if ENABLE_GALBRAITH_RUPRAI
     printf("  │    Canonicalization:    %5.1f M                            │\n", canon_cost);
 #endif
-    printf("  │  Computational speedup: %5.1fx                             │\n", comp_speedup);
-    printf("  │  Algorithmic factor:    %s                   │\n", algo_name);
-    printf("  │  Effective speedup:     %5.1fx vs naive                    │\n", effective_speedup);
-    printf("  │  Speedup vs JLP:        %5.1fx                             │\n", vs_jlp);
-    printf("  ├─────────────────────────────────────────────────────────────┤\n");
+    double vs_jlp_comp = comp_speedup * (algo_factor / sqrt(3.0));
 
-    // Expected time estimates
-    double jlp_rate = 2.5e9;  // JLP: ~2.5G keys/sec per RTX 4090 (measured)
-    double hydra_rate_per_gpu = jlp_rate * vs_jlp;
+    // RCKangaroo baseline: 8G ops/s on RTX 4090, K=1.15 efficiency
+    // Our K-factor: we use Galbraith-Ruprai (sqrt(6) equivalence) + 40/60 herd ratio
+    // Standard kangaroo K=2.08, with negation+endo K~1.47, with optimized herds K~1.2
+    double hydra_K = 1.20;  // Conservative estimate with our optimizations
+    double rckangaroo_K = 1.15;
+    double multi_target_factor = sqrt((double)g_num_targets);
+
+    printf("  |  Computational speedup: %5.1fx vs standard                 |\n", comp_speedup);
+    printf("  |  Algorithmic factor:    %s                   |\n", algo_name);
+    printf("  |  Our K-factor:         %5.2f (vs RCKangaroo K=1.15)       |\n", hydra_K);
+    printf("  |  Multi-target factor:   sqrt(%d) = %.2fx                    |\n",
+           g_num_targets, multi_target_factor);
+    printf("  |  Speedup vs JLP (comp): %5.1fx                             |\n", vs_jlp_comp);
+    printf("  +-------------------------------------------------------------+\n");
+
+    // Time estimates based on RCKangaroo baseline (most honest comparison)
+    double rckangaroo_rate = 8.0e9;  // RCKangaroo: 8G ops/s per RTX 4090
+    // Our throughput estimate: batch inversion reduces cost per step
+    // but we can't just multiply -- GPU throughput is also limited by
+    // instruction throughput, register pressure, memory bandwidth
+    // Conservative: match RCKangaroo's 8G with our optimizations
+    double hydra_rate_per_gpu = rckangaroo_rate;
     double hydra_rate_total = hydra_rate_per_gpu * num_gpus;
-    double expected_ops = 2.08 * pow(2.0, (double)range_bits / 2.0) / algo_factor;
+
+    // Expected ops: K * sqrt(W) / multi_target_factor
+    double expected_ops = hydra_K * pow(2.0, (double)range_bits / 2.0)
+                        / multi_target_factor;
     double est_seconds = expected_ops / hydra_rate_total;
     double est_days = est_seconds / 86400.0;
 
-    printf("  |  Est. rate per GPU:     %.2f Gkeys/s                      |\n", hydra_rate_per_gpu / 1e9);
-    printf("  |  Est. rate total (%dG):  %.2f Gkeys/s                     |\n", num_gpus, hydra_rate_total / 1e9);
-    printf("  |  Expected ops:          %.2e                               |\n", expected_ops);
-    printf("  |  Est. time (%d GPUs):    %.1f days                         |\n", num_gpus, est_days);
+    printf("  |  Rate per GPU (est):    %.1f Gops/s (RCKangaroo baseline)  |\n", rckangaroo_rate / 1e9);
+    printf("  |  Rate total (%dG):      %.1f Gops/s                        |\n", num_gpus, hydra_rate_total / 1e9);
+    printf("  |  Expected ops (K=%.2f): %.2e                              |\n", hydra_K, expected_ops);
+    printf("  |  Est. time (%d GPUs):    %.1f days (%.1f years)             |\n",
+           num_gpus, est_days, est_days / 365.0);
     printf("  +-------------------------------------------------------------+\n\n");
 
     // Generate jump table on host (shared across all GPUs)

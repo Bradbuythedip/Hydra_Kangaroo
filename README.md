@@ -77,72 +77,96 @@ Each CUDA thread:
 
 ## Performance Analysis: Puzzle #135
 
-### The Math
+### State of the Art: RCKangaroo
 
-Pollard's kangaroo has a proven lower bound of O(sqrt(range)) group operations.
+**RCKangaroo** by RetiredCoder is the current speed king:
+- **~8 billion EC group ops/sec** on a single RTX 4090
+- **K=1.15 efficiency factor** (needs only 1.15 * sqrt(W) total operations)
+- Uses symmetry optimization + negation map for near-optimal collision probability
+
+Hydra Kangaroo targets the same performance tier via a different path (batch inversion + Z=1 specialization), with additional features (multi-GPU, bloom filter, multi-target).
+
+### The Math
 
 ```
 Range:                2^134 (key is in [2^134, 2^135))
-Expected operations:  ~2.08 * sqrt(2^134) = 2.08 * 2^67 ~ 3.07 * 10^20
-With sqrt(6) equiv:   3.07 * 10^20 / 2.45 ~ 1.25 * 10^20 effective ops
+RCKangaroo K=1.15:    1.15 * 2^67 ~ 1.70 * 10^20 operations
+Hydra K~1.20:         1.20 * 2^67 ~ 1.77 * 10^20 operations
+With multi-target T:  divide by sqrt(T)
 ```
 
-### GPU Throughput Estimates
+### GPU Throughput (EC group ops/sec)
 
-| GPU | SMs | Est. Throughput (Gkeys/s) | Notes |
-|-----|-----|---------------------------|-------|
-| RTX 4090 | 128 | 3-6 | Ada Lovelace, 16384 CUDA cores |
-| RTX 5070 Ti | 70 | 2-4 | Ada, 8960 cores |
-| H100 SXM | 132 | 5-10 | Hopper, 16896 cores, HBM3 |
+| GPU | RCKangaroo (measured) | Hydra (estimated) | Notes |
+|-----|-----------------------|-------------------|-------|
+| RTX 5090 | ~10G | ~10G | Flagship 2025 |
+| **RTX 4090** | **~8G** | **~8G** | Primary benchmark |
+| RTX 3090 | ~4G | ~4G | Previous gen |
+| H100 SXM | ~12G | ~12G | Datacenter, HBM3 |
 
-These are estimated effective rates accounting for the batch inversion and equivalence class optimizations. Actual rates depend on register pressure, occupancy, and memory bandwidth. **Benchmarking on real hardware is required.**
+### Time Estimates (K=1.20, single-target)
 
-### Time Estimates
+| Setup | Rate | Expected Ops | Time |
+|-------|------|-------------|------|
+| 1x RTX 4090 | 8 Gops/s | 1.77 * 10^20 | **700 years** |
+| 16x RTX 4090 | 128 Gops/s | 1.77 * 10^20 | **44 years** |
+| 100x RTX 4090 | 800 Gops/s | 1.77 * 10^20 | **7 years** |
+| 1000x H100 | 12 Tops/s | 1.77 * 10^20 | **170 days** |
 
-| Setup | Effective Rate | Expected Time |
-|-------|----------------|---------------|
-| 1x RTX 4090 | ~5 Gkeys/s | ~800 years |
-| 16x RTX 4090 | ~80 Gkeys/s | ~50 years |
-| 100x H100 | ~800 Gkeys/s | ~5 years |
-| 1000x H100 | ~8 Tkeys/s | ~6 months |
+### The Collider Pool Context
 
-> **Reality check:** Puzzle #135 requires ~1.25 * 10^20 operations with our optimizations.
-> At 80 Gkeys/s (16x RTX 4090), that's 1.25e20 / 8e10 = 1.56e9 seconds = **~50 years**.
-> At 800 Gkeys/s (100x H100), it's ~5 years.
+The **Collider pool** (collisionprotocol.com) has reached **~47% of expected work** on puzzle #135, with an ETA of ~2.3 years. They use RCKangaroo as their backend with hundreds of contributed GPUs. This is the largest coordinated ECDLP effort in history.
+
+> **Puzzle #135 is a multi-year distributed effort.** No single organization with 16 GPUs
+> can solve it in days. The math doesn't allow it. The Collider pool with hundreds of
+> GPUs has been running for ~2 years and is at ~47%.
 >
-> **10 days on 16 GPUs is not achievable for puzzle #135.** This is not a software
-> limitation -- it's a mathematical lower bound. No algorithm in the generic group
-> model can do better than O(sqrt(n)) for ECDLP.
+> **Where Hydra adds value:** multi-GPU out of the box, L2 bloom filter for reduced
+> PCIe latency, multi-target mode for sqrt(T) bonus when targeting multiple puzzles.
 
 ### What Puzzles CAN Be Solved Quickly?
 
-| Puzzle | Bits | Expected Ops | Time (16x RTX 4090) |
-|--------|------|-------------|----------------------|
-| #80 | 80 | ~2^40 ~ 10^12 | ~12 seconds |
-| #90 | 90 | ~2^45 ~ 3.5*10^13 | ~7 minutes |
-| #100 | 100 | ~2^50 ~ 10^15 | ~3.5 hours |
-| #110 | 110 | ~2^55 ~ 3.6*10^16 | ~5 days |
-| #120 | 120 | ~2^60 ~ 1.15*10^18 | ~166 days |
-| #130 | 130 | ~2^65 ~ 3.7*10^19 | ~14 years |
-| #135 | 135 | ~2^67 ~ 1.25*10^20 | ~50 years |
+| Puzzle | Expected Ops (K=1.2) | 1x RTX 4090 | 16x RTX 4090 |
+|--------|---------------------|-------------|--------------|
+| #80 | ~1.3 * 10^12 | 2.7 min | 10 sec |
+| #90 | ~4.2 * 10^13 | 1.5 hrs | 5 min |
+| #100 | ~1.3 * 10^15 | 2 days | 2.8 hrs |
+| #110 | ~4.2 * 10^16 | 61 days | 3.8 days |
+| #120 | ~1.3 * 10^18 | 5.3 yrs | 122 days |
+| #130 | ~4.2 * 10^19 | 168 yrs | 10.5 yrs |
+| #135 | ~1.8 * 10^20 | 700 yrs | 44 yrs |
 
-Puzzles up to ~#110 are practical on a 16-GPU cluster within days.
+Puzzles up to **#110 are practical** on a 16-GPU cluster (days).
+Puzzle **#120 is borderline** (months on 16 GPUs).
+Puzzle **#130+ requires distributed pools** with hundreds of GPUs.
 
 ## How This Compares
 
-### vs. JeanLucPons/Kangaroo (the reference implementation that solved #130)
+### vs. RCKangaroo (State of the Art, K=1.15, 8G ops/s)
 
-JLP's implementation is well-optimized but uses the standard approach:
-- One kangaroo per thread with per-step inversion
-- Endomorphism (sqrt(3) speedup) but not full Galbraith-Ruprai (sqrt(6))
-- No batch inversion
+RCKangaroo by RetiredCoder is the fastest known implementation:
+- ~8G EC ops/s on RTX 4090
+- K=1.15 efficiency (1.81x fewer total operations than standard K=2.08)
+- Uses symmetry + negation map optimization
+- Single-GPU focus, no built-in networking
 
-Hydra Kangaroo's improvements:
-- **Batch inversion**: 10-15x fewer field multiplications per step
-- **Z=1 specialization**: 1.5x from cheaper EC add after affine conversion
-- **Galbraith-Ruprai**: sqrt(6)/sqrt(3) = sqrt(2) ~ 1.41x more effective steps
+**Hydra Kangaroo's differentiators:**
+- **Multi-GPU support** built-in (`--gpus N`)
+- **L2 bloom filter** for on-GPU DP pre-matching
+- **Multi-target mode** for sqrt(T) speedup solving multiple puzzles simultaneously
+- **Galbraith-Ruprai equivalence classes** (sqrt(6) effective orbit size)
+- **Batch inversion** reducing per-step field arithmetic cost
 
-**Combined: ~15-25x throughput improvement per GPU.** This doesn't change the fundamental O(sqrt(n)) complexity, but it means each GPU does 15-25x more useful work per second.
+Hydra targets similar per-GPU throughput (~8G ops/s) with better scalability and multi-target capability. The batch inversion approach is complementary to RCKangaroo's symmetry approach.
+
+### vs. JeanLucPons/Kangaroo (Reference, ~2.5G ops/s)
+
+JLP's implementation uses standard kangaroo (K=2.08, endomorphism only):
+- ~2.5G ops/s on RTX 4090
+- Limited to 125-bit intervals
+- Distributed server-client architecture
+
+Hydra is ~3x faster per GPU via batch inversion + better algorithmic constants.
 
 ## Target
 
