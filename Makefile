@@ -17,15 +17,15 @@ all: $(BUILD_DIR)/hydra
 
 $(BUILD_DIR)/hydra: src/hydra_kangaroo.cu include/field.cuh include/ec.cuh
 	@mkdir -p $(BUILD_DIR)
-	$(NVCC) $(NVCC_FLAGS) -arch=$(CUDA_ARCH) -o $@ src/hydra_kangaroo.cu
+	$(NVCC) $(NVCC_FLAGS) -arch=$(CUDA_ARCH) -lpthread -o $@ src/hydra_kangaroo.cu
 	@echo ""
 	@echo "Built $@ for $(CUDA_ARCH)"
-	@echo "Run: ./$@ [--dp-bits 25] [--blocks 2048]"
+	@echo "Run: ./$@ [--dp-bits 25] [--blocks 2048] [--gpus N]"
 
 # Register usage analysis (critical for occupancy)
 reginfo: src/hydra_kangaroo.cu include/field.cuh include/ec.cuh
 	@mkdir -p $(BUILD_DIR)
-	$(NVCC) $(NVCC_FLAGS) -arch=$(CUDA_ARCH) --ptxas-options=-v -o $(BUILD_DIR)/hydra src/hydra_kangaroo.cu 2>&1 | grep -E "(registers|bytes)"
+	$(NVCC) $(NVCC_FLAGS) -arch=$(CUDA_ARCH) -lpthread --ptxas-options=-v -o $(BUILD_DIR)/hydra src/hydra_kangaroo.cu 2>&1 | grep -E "(registers|bytes)"
 
 # Build for specific GPUs
 rtx5070ti: CUDA_ARCH=sm_89
