@@ -196,6 +196,109 @@ void ec_batch_to_affine(const JacobianPoint *points, AffinePoint *out) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Z=1 SPECIALIZED MIXED ADDITION: Affine + Affine -> Jacobian
+// When Z=1 (after affine conversion), saves 3M + 2S per step.
+// Cost: 4M + 2S  (vs 7M + 4S for general mixed add)
+// ═══════════════════════════════════════════════════════════════
+
+__device__
+JacobianPoint ec_add_mixed_z1(const AffinePoint *p, const AffinePoint *q) {
+    // P is affine (Z=1), Q is the jump point (affine)
+    // H = X2 - X1
+    u256 H = fp_sub(&q->x, &p->x);
+    // rr = 2*(Y2 - Y1)  — but here we use the standard formula scaled
+    u256 dy = fp_sub(&q->y, &p->y);
+
+    u256 HH = fp_sqr(&H);            // H^2  (1S)
+    u256 I = fp_dbl(&HH);
+    I = fp_dbl(&I);                    // I = 4*H^2
+    u256 J = fp_mul(&H, &I);          // J = H*I  (1M)
+
+    u256 rr = fp_dbl(&dy);            // r = 2*(Y2 - Y1)
+    u256 V = fp_mul(&p->x, &I);       // V = X1*I  (1M)
+
+    JacobianPoint res;
+
+    // X3 = r^2 - J - 2*V
+    u256 r2 = fp_sqr(&rr);            // (1S)
+    u256 V2 = fp_dbl(&V);
+    u256 t = fp_sub(&r2, &J);
+    res.X = fp_sub(&t, &V2);
+
+    // Y3 = r*(V - X3) - 2*Y1*J
+    u256 vmx = fp_sub(&V, &res.X);
+    u256 rvmx = fp_mul(&rr, &vmx);    // (1M)
+    u256 Y1J = fp_mul(&p->y, &J);     // (1M)
+    u256 Y1J2 = fp_dbl(&Y1J);
+    res.Y = fp_sub(&rvmx, &Y1J2);
+
+    // Z3 = 2*H  (since Z1=1)
+    res.Z = fp_dbl(&H);
+
+    return res;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// GALBRAITH-RUPRAI CANONICALIZATION
+// Maps a point to its canonical equivalence class representative.
+// Among {x, beta*x, beta^2*x}, pick the smallest x-coordinate.
+// Returns: canonical x, and the lambda exponent (0, 1, or 2).
+// Cost: 2M + 2 comparisons
+// ═══════════════════════════════════════════════════════════════
+
+// beta^2 mod P (precomputed: beta^2 = P - beta - 1 for secp256k1, or compute directly)
+// beta^2 = 0x851695D49A83F8EF919B861596B8A116D77F9B14C35C127C2B5E2DDAE8B07FE7
+static const u256 ENDO_BETA2 = {{
+    0x2B5E2DDAE8B07FE7ULL, 0xD77F9B14C35C127CULL,
+    0x919B861596B8A116ULL, 0x851695D49A83F8EFULL
+}};
+
+__device__
+u256 ec_canonicalize_x(const u256 *x, int *lambda_exp) {
+    // Compute the 3 candidate x-coordinates
+    u256 x0 = *x;
+    u256 x1 = fp_mul(&ENDO_BETA, x);   // beta * x
+    u256 x2 = fp_mul(&ENDO_BETA2, x);  // beta^2 * x
+
+    // Find minimum (lexicographic on limbs, MSB first)
+    // Start assuming x0 is min
+    u256 min_x = x0;
+    *lambda_exp = 0;
+
+    // Compare x1 < min_x
+    int x1_less = 0;
+    for (int i = 3; i >= 0; i--) {
+        if (x1.d[i] < min_x.d[i]) { x1_less = 1; break; }
+        if (x1.d[i] > min_x.d[i]) { break; }
+    }
+    if (x1_less) { min_x = x1; *lambda_exp = 1; }
+
+    // Compare x2 < min_x
+    int x2_less = 0;
+    for (int i = 3; i >= 0; i--) {
+        if (x2.d[i] < min_x.d[i]) { x2_less = 1; break; }
+        if (x2.d[i] > min_x.d[i]) { break; }
+    }
+    if (x2_less) { min_x = x2; *lambda_exp = 2; }
+
+    return min_x;
+}
+
+// Lambda scalar (for walk distance correction)
+// lambda = 0x5363AD4CC05C30E0A5261C028812645A122E22EA20816678DF02967C1B23BD72
+static const u256 ENDO_LAMBDA = {{
+    0xDF02967C1B23BD72ULL, 0x122E22EA20816678ULL,
+    0xA5261C028812645AULL, 0x5363AD4CC05C30E0ULL
+}};
+
+// lambda^2 mod N
+// lambda^2 = 0xAC9C52B33FA3CF1F5AD9E3FD77ED9BA4A880B9FC8EC739C2E0CFC810B51283CF
+static const u256 ENDO_LAMBDA2 = {{
+    0xE0CFC810B51283CFULL, 0xA880B9FC8EC739C2ULL,
+    0x5AD9E3FD77ED9BA4ULL, 0xAC9C52B33FA3CF1FULL
+}};
+
+// ═══════════════════════════════════════════════════════════════
 // ENDOMORPHISM: lambda*P = (beta*x, y) where beta^3 = 1 (mod p)
 // Cost: 1 field multiplication (beta*x)
 // ═══════════════════════════════════════════════════════════════
