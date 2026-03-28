@@ -494,7 +494,12 @@ void init_kangaroos(KangarooState *h_states, uint32_t total_kangaroos) {
         if (i % 2 == 0) {
             // Tame: start at start_scalar * G (relative to range start)
             JacobianPoint pt = h_ec_scalar_mul(&start_scalar, &GENERATOR);
-            h_states[i].pos = pt;
+            AffinePoint aff = h_ec_to_affine(&pt);
+            // Store as Jacobian with Z=1 (kernel reads X,Y as affine)
+            h_states[i].pos.X = aff.x;
+            h_states[i].pos.Y = aff.y;
+            h_states[i].pos.Z.d[0] = 1; h_states[i].pos.Z.d[1] = 0;
+            h_states[i].pos.Z.d[2] = 0; h_states[i].pos.Z.d[3] = 0;
             h_states[i].walk_dist = start_scalar;
             h_states[i].type = 0;
         } else {
@@ -506,7 +511,11 @@ void init_kangaroos(KangarooState *h_states, uint32_t total_kangaroos) {
             Q_prime_jac2.Z.d[0] = 1; Q_prime_jac2.Z.d[1] = 0;
             Q_prime_jac2.Z.d[2] = 0; Q_prime_jac2.Z.d[3] = 0;
             JacobianPoint pt = h_ec_add_mixed(&Q_prime_jac2, &sG_aff);
-            h_states[i].pos = pt;
+            AffinePoint aff = h_ec_to_affine(&pt);
+            h_states[i].pos.X = aff.x;
+            h_states[i].pos.Y = aff.y;
+            h_states[i].pos.Z.d[0] = 1; h_states[i].pos.Z.d[1] = 0;
+            h_states[i].pos.Z.d[2] = 0; h_states[i].pos.Z.d[3] = 0;
             h_states[i].walk_dist = start_scalar;
             h_states[i].type = 1;
         }
@@ -526,14 +535,59 @@ void init_kangaroos(KangarooState *h_states, uint32_t total_kangaroos) {
 #include <vector>
 
 struct DPMatch {
+    u256 x_affine;       // Full x for exact comparison
     u256 walk_distance;
     uint32_t type;
 };
 
 std::unordered_map<uint64_t, std::vector<DPMatch>> dp_table;
 
+static inline bool h_u256_eq(const u256 *a, const u256 *b) {
+    return a->d[0] == b->d[0] && a->d[1] == b->d[1] &&
+           a->d[2] == b->d[2] && a->d[3] == b->d[3];
+}
+
 uint64_t dp_hash(const u256 *x) {
-    return x->d[0] ^ x->d[1] ^ x->d[2] ^ x->d[3];
+    return x->d[0] ^ (x->d[1] * 0x9E3779B97F4A7C15ULL)
+                    ^ (x->d[2] * 0x517CC1B727220A95ULL)
+                    ^ (x->d[3] * 0x6C62272E07BB0142ULL);
+}
+
+// Recover private key from tame-wild collision
+// key = range_start + tame_dist - wild_dist
+void recover_key(const u256 *tame_dist, const u256 *wild_dist) {
+    // k = range_start + tame_dist - wild_dist
+    uint32_t carry, borrow;
+    u256 sum = h_u256_add(&RANGE_START, tame_dist, &carry);
+    u256 key = h_u256_sub(&sum, wild_dist, &borrow);
+
+    printf("\n  ***********************************************************\n");
+    printf("  *  PRIVATE KEY RECOVERED!                                  *\n");
+    printf("  ***********************************************************\n");
+    printf("  Key: %016lx%016lx%016lx%016lx\n",
+           key.d[3], key.d[2], key.d[1], key.d[0]);
+    printf("  ***********************************************************\n");
+
+    // Verify: compute key * G and check against TARGET_Q
+    JacobianPoint verify = h_ec_scalar_mul(&key, &GENERATOR);
+    AffinePoint verify_aff = h_ec_to_affine(&verify);
+    if (h_u256_eq(&verify_aff.x, &TARGET_Q.x)) {
+        printf("  VERIFICATION: Key is CORRECT!\n");
+    } else {
+        printf("  VERIFICATION: Key MISMATCH — checking range_start - tame + wild...\n");
+        // Try the other direction
+        u256 sum2 = h_u256_add(&RANGE_START, wild_dist, &carry);
+        u256 key2 = h_u256_sub(&sum2, tame_dist, &borrow);
+        JacobianPoint v2 = h_ec_scalar_mul(&key2, &GENERATOR);
+        AffinePoint v2a = h_ec_to_affine(&v2);
+        if (h_u256_eq(&v2a.x, &TARGET_Q.x)) {
+            printf("  Key (alt): %016lx%016lx%016lx%016lx\n",
+                   key2.d[3], key2.d[2], key2.d[1], key2.d[0]);
+            printf("  VERIFICATION: Alternate key is CORRECT!\n");
+        } else {
+            printf("  WARNING: Neither direction verified. Possible endomorphism DP.\n");
+        }
+    }
 }
 
 bool check_dp_collision(const DPEntry *entry) {
@@ -541,21 +595,35 @@ bool check_dp_collision(const DPEntry *entry) {
     auto it = dp_table.find(key);
     if (it != dp_table.end()) {
         for (auto &existing : it->second) {
-            if ((existing.type & 1) != (entry->type & 1)) {
+            // Must match on full x AND be tame-wild pair
+            if (h_u256_eq(&existing.x_affine, &entry->x_affine) &&
+                (existing.type & 1) != (entry->type & 1)) {
+
                 printf("\n  +==========================================+\n");
                 printf("  |  DP COLLISION DETECTED!                  |\n");
                 printf("  +==========================================+\n");
+
+                const u256 *tame_d, *wild_d;
+                if ((existing.type & 1) == 0) {
+                    tame_d = &existing.walk_distance;
+                    wild_d = &entry->walk_distance;
+                } else {
+                    tame_d = &entry->walk_distance;
+                    wild_d = &existing.walk_distance;
+                }
+
                 printf("  Tame dist: %016lx%016lx%016lx%016lx\n",
-                    existing.walk_distance.d[3], existing.walk_distance.d[2],
-                    existing.walk_distance.d[1], existing.walk_distance.d[0]);
+                    tame_d->d[3], tame_d->d[2], tame_d->d[1], tame_d->d[0]);
                 printf("  Wild dist: %016lx%016lx%016lx%016lx\n",
-                    entry->walk_distance.d[3], entry->walk_distance.d[2],
-                    entry->walk_distance.d[1], entry->walk_distance.d[0]);
+                    wild_d->d[3], wild_d->d[2], wild_d->d[1], wild_d->d[0]);
+
+                recover_key(tame_d, wild_d);
                 return true;
             }
         }
     }
     DPMatch m;
+    m.x_affine = entry->x_affine;
     m.walk_distance = entry->walk_distance;
     m.type = entry->type;
     dp_table[key].push_back(m);
