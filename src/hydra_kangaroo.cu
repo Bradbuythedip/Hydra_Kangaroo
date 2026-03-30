@@ -476,20 +476,55 @@ __global__ void kangaroo_pipelined_walk(
             pos[k] = ec_add_z1_phase3(&p, &s2[k]);
         }
 
-        // ━━━ PHASE 4: x-Only Batch Affine (Deferred-Y) ━━━
-        // (Analog to Deferred-A: defer y-resolution, compute only x)
+        // ━━━ PHASE 4: UNIFIED Batch Affine (Single Inversion) ━━━
+        // OPTIMIZATION: Single batch inversion computes BOTH x and y.
+        // x is used for DP check; y is used for negation map.
+        // Previous version did TWO batch inversions — this eliminates one.
+        //
+        // Key insight from puzzle_binary: the Deferred-A technique defers
+        // computation but doesn't DUPLICATE it. Similarly, we compute
+        // Z^(-1) once, cache it, derive both Z^(-2) and Z^(-3) from it.
+        //
+        // Cost: 1 inv + 3K muls (same as before, but only ONCE)
+        //   Z^(-1) from batch inv:     1 inv + 3(K-1) muls
+        //   Z^(-2) = Z^(-1)²:          K squarings
+        //   Z^(-3) = Z^(-2) × Z^(-1):  K muls
+        //   x = X × Z^(-2):            K muls
+        //   y = Y × Z^(-3):            K muls
+        //
+        // vs two inversions (old approach):
+        //   First inv:  1 inv + 3(K-1) muls + K squarings + K muls   (x-only)
+        //   Second inv: 1 inv + 3(K-1) muls + 2K muls + K squarings  (y)
+        //   = 2 inversions + 6(K-1) + 2K + 2K muls
+        //
+        // SAVINGS: Eliminates entire second batch inversion
+        //   = 255 squarings + 15 multiplications + 3(K-1) muls
+        //   = ~365 field operations per round SAVED
 
-        u256 x_new[KANGAROOS_PER_THREAD];
-        ec_batch_to_xonly_ptx<KANGAROOS_PER_THREAD>(pos, x_new);
+        {
+            u256 z_vals[KANGAROOS_PER_THREAD];
+            #pragma unroll
+            for (int k = 0; k < KANGAROOS_PER_THREAD; k++) {
+                z_vals[k] = pos[k].Z;
+            }
+
+            u256 z_invs[KANGAROOS_PER_THREAD];
+            fp_batch_inv<KANGAROOS_PER_THREAD>(z_vals, z_invs);
+
+            #pragma unroll
+            for (int k = 0; k < KANGAROOS_PER_THREAD; k++) {
+                u256 zi2 = fp_sqr_ptx(&z_invs[k]);        // Z^(-2)
+                u256 zi3 = fp_mul_ptx(&zi2, &z_invs[k]);  // Z^(-3)
+                x_aff[k] = fp_mul_ptx(&pos[k].X, &zi2);   // x = X·Z^(-2)
+                y_aff[k] = fp_mul_ptx(&pos[k].Y, &zi3);   // y = Y·Z^(-3)
+            }
+        }
 
         // ━━━ PHASE 5: Progressive DP Check (Early Termination) ━━━
         // (Analog to nonce_filter: gate off expensive work for non-DPs)
 
         #pragma unroll
         for (int k = 0; k < KANGAROOS_PER_THREAD; k++) {
-            // Update x-only affine state
-            x_aff[k] = x_new[k];
-
             // EARLY TERMINATION: low-byte precheck (rejects 99.6%)
             if (!dp_precheck(&x_aff[k], dp_mask)) continue;
 
@@ -518,38 +553,6 @@ __global__ void kangaroo_pipelined_walk(
                     dp_output[idx].type = type[k];
                     dp_output[idx].thread_id = tid;
                 }
-            }
-        }
-
-        // ━━━ PHASE 6: Recover y for next step's negation map ━━━
-        // We need y-parity for the negation map. Compute from Jacobian.
-        // Y_affine = Y * Z^(-3). But we only need the parity bit (LSB).
-        // Optimization: Z^(-3) parity = Z^(-1) parity * Z^(-2) parity
-        // But this is complex. Instead, use Y directly from the Jacobian:
-        // y_affine_parity = Y * Z^(-3) mod P parity
-        // Since we need full y for the negation map, recover it.
-        // This is still cheaper than full batch_to_affine because we
-        // already have x from the x-only pass.
-
-        // Collect Z^(-1) values (re-batch-invert, or cache from Phase 4)
-        // For simplicity, recover y via the Jacobian identity:
-        // We already have pos[k] and x_new[k]. We need Z^(-3)*Y.
-
-        {
-            u256 z_vals[KANGAROOS_PER_THREAD];
-            #pragma unroll
-            for (int k = 0; k < KANGAROOS_PER_THREAD; k++) {
-                z_vals[k] = pos[k].Z;
-            }
-
-            u256 z_invs[KANGAROOS_PER_THREAD];
-            fp_batch_inv<KANGAROOS_PER_THREAD>(z_vals, z_invs);
-
-            #pragma unroll
-            for (int k = 0; k < KANGAROOS_PER_THREAD; k++) {
-                u256 zi2 = fp_sqr_ptx(&z_invs[k]);
-                u256 zi3 = fp_mul_ptx(&zi2, &z_invs[k]);
-                y_aff[k] = fp_mul_ptx(&pos[k].Y, &zi3);
             }
         }
     }
