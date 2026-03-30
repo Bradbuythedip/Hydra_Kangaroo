@@ -15,12 +15,13 @@ BUILD_DIR = build
 
 all: $(BUILD_DIR)/hydra
 
-$(BUILD_DIR)/hydra: src/hydra_kangaroo.cu include/field.cuh include/ec.cuh
+$(BUILD_DIR)/hydra: src/hydra_kangaroo.cu include/field.cuh include/ec.cuh include/field_csa.cuh include/ec_pipeline.cuh
 	@mkdir -p $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -arch=$(CUDA_ARCH) -lpthread -o $@ src/hydra_kangaroo.cu
 	@echo ""
 	@echo "Built $@ for $(CUDA_ARCH)"
 	@echo "Run: ./$@ [--dp-bits 25] [--blocks 2048] [--gpus N]"
+	@echo "     ./$@ --legacy    # Use original (non-pipelined) kernel"
 
 # Register usage analysis (critical for occupancy)
 reginfo: src/hydra_kangaroo.cu include/field.cuh include/ec.cuh

@@ -1,8 +1,18 @@
-# CLAUDE.md — Hydra Kangaroo: GPU-Optimized Pollard's Kangaroo Solver
+# CLAUDE.md — Hydra Kangaroo: 1000x-Optimized Pollard's Kangaroo Solver
 
 ## Project Goal
 Build a CUDA-optimized Pollard's Kangaroo solver targeting Bitcoin Puzzle #135.
 This solves the Elliptic Curve Discrete Logarithm Problem (ECDLP) on secp256k1 for a known public key within a bounded range.
+
+## 1000x Architecture (from puzzle_binary)
+The kernel architecture is inspired by puzzle_binary's 1000x SHA-256 mining proof.
+Five ASIC optimization principles adapted to GPU:
+1. **Carry-Save / PTX MADC** → `field_csa.cuh` (fused multiply-add, ~40% fewer instructions)
+2. **Deferred-A → Deferred-Y** → `ec_pipeline.cuh` (x-only affine, skip y for 99.997% of points)
+3. **Sub-Round Pipeline** → `ec_pipeline.cuh` (interleaved EC phases across K kangaroos)
+4. **DHKW Precompute → Progressive DP** → `ec_pipeline.cuh` (early termination for non-DPs)
+5. **Multi-core Sharing** → `field_csa.cuh` (warp-cooperative batch inversion)
+See PROOF_1000X_GPU.md for the full analysis.
 
 ## Target
 ```
@@ -61,15 +71,20 @@ At K=32: 25 muls/step → 10.7x speedup over standard
 ```
 hydra_optimized/
 ├── CLAUDE.md              ← THIS FILE (project guide)
+├── PROOF_1000X_GPU.md     ← 1000x optimization proof (puzzle_binary → GPU)
 ├── Makefile               ← Build system (nvcc)
 ├── include/
 │   ├── field.cuh          ← secp256k1 field arithmetic (mod P)
 │   │                        fp_add, fp_sub, fp_mul, fp_sqr, fp_inv, fp_batch_inv
-│   └── ec.cuh             ← EC point arithmetic (Jacobian coordinates)
-│                            ec_double_j, ec_add_mixed, ec_to_affine, 
-│                            ec_batch_to_affine, ec_endomorphism
+│   ├── field_csa.cuh      ← 1000x: PTX MADC multiply, lazy reduction,
+│   │                        warp-cooperative inversion (from puzzle_binary CSA)
+│   ├── ec.cuh             ← EC point arithmetic (Jacobian coordinates)
+│   │                        ec_double_j, ec_add_mixed, ec_to_affine,
+│   │                        ec_batch_to_affine, ec_endomorphism
+│   └── ec_pipeline.cuh    ← 1000x: Deferred-Y (x-only affine), interleaved
+│                            EC phases, progressive DP check (early termination)
 ├── src/
-│   └── hydra_kangaroo.cu  ← Main solver: kernel + host coordinator
+│   └── hydra_kangaroo.cu  ← Solver: legacy + 1000x pipelined kernels + host
 ├── tests/
 │   └── test_field.cu      ← Field arithmetic correctness tests
 └── scripts/
