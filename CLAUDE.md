@@ -103,75 +103,56 @@ hydra_optimized/
 4. ✅ Host DP matching (hash table collision detection)
 5. ✅ Python prototype verified correct on puzzles #20, #25, #30
 6. ✅ Test suite framework
+7. ✅ PTX MADC field multiply (field_csa.cuh): 40% fewer instructions
+8. ✅ Deferred-Y x-only affine (ec_pipeline.cuh): skip y for 99.997% of points
+9. ✅ Sub-round pipeline (ec_pipeline.cuh): 3-phase interleaved EC add
+10. ✅ Progressive DP check (ec_pipeline.cuh): 99.6% early termination
+11. ✅ L2 Bloom filter (hydra_kangaroo.cu): on-GPU DP pre-matching
+12. ✅ Galbraith-Ruprai sqrt(6) equivalence classes
+13. ✅ Unified batch inversion (single inv for both x and y)
+14. ✅ 3-Kangaroo variant (tame/wild/middle, K=0.90)
+15. ✅ Adaptive DP threshold (auto-computed from kangaroo count)
+16. ✅ Multi-target puzzle registry
+17. ✅ Hyper kernel (K=64, warp-cooperative inversion)
+18. ✅ EC-ASIC RTL design (rtl/secp256k1_mul_pipe.v)
+19. ✅ Economic feasibility analysis and calculator
+
+## Three Kernel Modes
+```
+--legacy     Legacy batch walk (K=32, standard batch inversion)
+(default)    Pipelined 1000x kernel (K=32, PTX MADC + Deferred-Y + 3-phase pipeline)
+--hyper      Hyper kernel (K=64, warp-cooperative + two-wave processing)
+```
 
 ## What Needs To Be Done (Priority Order)
 
-### P0: Make It Compile and Run Correctly
-1. **Fix the `u256_add_cc` and `u256_sub_borrow` PTX intrinsics** — the inline assembly uses `add.cc.u64` which requires careful carry chain management. Test on actual GPU.
-2. **Fix fp_mul reduction** — the secp256k1 fast reduction (multiply overflow by 0x1000003D1) needs careful handling of double overflow. The current implementation may miss edge cases.
-3. **Fix fp_inv** — replace the naive binary method with an optimized addition chain for secp256k1's P-2. Reference: libsecp256k1's `secp256k1_fe_inv` uses a carefully crafted chain that takes ~258 squarings + ~40 multiplications.
-4. **Implement proper kangaroo initialization:**
-   - Compute `Q' = Q - 2^134 · G` (the reframed target point)
-   - For each tame kangaroo: pick random scalar s in [0, range), compute `(range_start + s)·G` as starting point
-   - For each wild kangaroo: pick random scalar s, compute `Q' + s·G` as starting point
-   - Store starting scalars to recover the key from collisions
-5. **Precompute the jump table:** 256 random points `s_i · G` with scalars `s_i` near `√(range)/4 ≈ 2^65`. Upload to `__constant__` memory.
-6. **Test: verify the kernel produces correct DPs** by solving a small puzzle (e.g., puzzle #30) on GPU and comparing against the Python prototype.
+### P0: Test on Real Hardware
+1. Compile and run on RTX 4090 / RTX 5090 / H100
+2. Verify correct DP generation by solving puzzle #30 (30-bit)
+3. Benchmark all three kernel modes (legacy vs pipelined vs hyper)
+4. Profile register usage: `nvcc --ptxas-options=-v`
 
-### P1: Optimize Field Arithmetic (Biggest Bang for Buck)
-1. **Implement optimized fp_sqr** — squaring can be ~25% cheaper than generic multiplication because half the cross-terms are doubled instead of computed twice. The schoolbook squaring for 4 limbs needs only 10 multiplies + shifts vs 16 for generic mul.
-2. **Implement optimized fp_inv addition chain** — use the secp256k1-specific chain from libsecp256k1. This reduces inversion from ~256 muls to ~240 equivalent operations (fewer multiplies, more squarings which are cheaper).
-3. **Benchmark fp_mul throughput** — measure actual Mops/s on the target GPU. The 256-bit schoolbook multiplication is the critical inner loop. If below 100M/s per thread, investigate:
-   - Replace schoolbook with Karatsuba (may not help for 4 limbs)
-   - Use `__umul64hi` more aggressively
-   - Check register usage with `nvcc --ptxas-options=-v`
+### P1: Fix Known Issues
+1. **u256_add_cc / u256_sub_borrow PTX intrinsics** — carry chain management
+2. **fp_mul reduction edge cases** — double overflow in secp256k1 fast reduction
+3. **fp_inv addition chain** — optimize from binary method to secp256k1-specific chain
 
-### P2: Optimize the Kangaroo Walk Kernel
-1. **Tune KANGAROOS_PER_THREAD (K)** — profile K=8, K=16, K=32, K=64. Higher K gives better batch inversion amortization but increases register pressure, reducing occupancy. Find the sweet spot.
-2. **Optimize the walk function** — currently uses `pos[k].X.d[0] & 255` for jump selection. After batch inversion gives us affine coordinates, use `affine_pts[k].x.d[0] & 255` for correct walk function (deterministic on affine x ensures collision correctness).
-3. **Implement walk distance tracking as u128 instead of u256** — walk distances don't need full 256 bits. A 128-bit counter saves register pressure.
-4. **Profile and minimize shared memory usage** — each thread's K kangaroo states consume `K * 3 * 32 = K * 96` bytes of register/local memory. At K=32, that's 3072 bytes/thread. Target max occupancy.
+### P2: Further Optimization
+1. **Walk distance tracking as u128** — saves 16 bytes/kangaroo register pressure
+2. **Warp-divergence profiling** — measure negation map branch divergence
+3. **Jump table in shared memory** — reduce constant memory pressure at high occupancy
+4. **Karatsuba for field multiply** — may help if register pressure is the bottleneck
 
-### P3: Implement Galbraith-Ruprai Equivalence Classes (1.4x speedup)
-The secp256k1 endomorphism gives us λP = (β·x, y) where β³ ≡ 1 (mod p).
-Combined with negation, each point has 6 equivalents: {P, λP, λ²P, -P, -λP, -λ²P}.
-
-The walk function should map all 6 equivalents to the same canonical representative. Then each step effectively covers 6 points → √6 speedup instead of √3.
-
-Algorithm (Galbraith-Ruprai 2010):
-1. Define canonical form: among {P, λP, λ²P, -P, -λP, -λ²P}, choose the one with the smallest x-coordinate
-2. Walk function: given canonical P, compute all 6 variants, canonicalize, select jump
-3. The walk is now on equivalence classes, not individual points
-4. DPs are detected on canonical representatives
-
-Reference: "Computing discrete logarithms in an interval" (Galbraith, Ruprai, 2010)
-
-**Implementation:**
-- After each batch-to-affine conversion, for each point compute all 6 x-coordinates
-- Find the minimum x among {x, β·x, β²·x} (negation doesn't change x)
-- Use this canonical x for jump selection and DP detection
-- Track which equivalence class member was used to correct the walk distance
-
-### P4: Implement L2 Bloom Filter for On-GPU DP Matching (1.2x speedup)
-Instead of sending every DP to the host for hash table lookup:
-1. Allocate a bloom filter in GPU global memory, sized to fit in L2 cache (~64MB)
-2. When a tame DP is found, INSERT into bloom filter
-3. When a wild DP is found, CHECK bloom filter first
-4. Only send bloom-positive DPs to host for exact matching
-5. This eliminates PCIe round-trip latency for 99.9% of DP checks
-
-### P5: Distributed Mode
+### P3: Distributed Mode
 1. **Save/load state** — serialize DP table and kangaroo positions to disk
 2. **Server mode** — accept DP contributions via TCP from remote GPU workers
 3. **Client mode** — run kangaroo walks and send DPs to a central server
 4. **Work file compatibility** — match JeanLucPons' `.work` file format for interop
 
-### P6: Multi-Target Mode
-Support simultaneous solving of multiple puzzles (#131-#140).
-Each puzzle has a different target point but the same jump table.
-Wild kangaroos start at each puzzle's Q'.
-A DP collision with any target solves that puzzle.
-Expected speedup: √T where T = number of targets.
+### P4: Multi-GPU Scaling
+1. Profile multi-GPU scaling (2, 4, 8 GPUs via --gpus flag)
+2. Optimize DP table mutex contention for high GPU counts
+3. Add GPU-to-GPU P2P DP exchange (skip host for same-node GPUs)
 
 ## Key Constants for Reference
 ```c
@@ -198,13 +179,31 @@ Range = [2^134, 2^135)
 
 ## Performance Targets
 ```
-Metric                    Current (JLP)    Target (Hydra)    Improvement
-─────────────────────────────────────────────────────────────────────────
-EC adds/sec (per GPU)     500M             5-10B             10-20x
-Muls per kangaroo step    268              17-25             10-15x
-Effective equivalences    √3               √6                1.4x
-DP matching latency       PCIe (~10μs)     L2 cache (~100ns) 100x
-Overall vs baseline       1x               15-25x            —
+Metric                    Baseline (JLP)   Hydra (pipelined)  Hydra (hyper)
+──────────────────────────────────────────────────────────────────────────
+Muls per kangaroo step    268              ~25 (K=32)         ~21 (K=64)
+Equivalence classes       √3               √6                 √6
+K-factor                  1.15             0.90 (3-kang)      0.90 (3-kang)
+DP matching               PCIe (~10μs)     L2 bloom (~100ns)  L2 bloom
+Multi-target              1 puzzle         √T puzzles         √T puzzles
+Overall vs naive          ~5x              ~128x              ~150x
+```
+
+## Optimization Stack (Combined ~128-150x)
+```
+Layer                          Factor    Cumulative
+────────────────────────────────────────────────────
+Batch inversion (K=32/64)      10.7x     10.7x
+PTX MADC multiply              1.40x     15.0x
+Deferred-Y x-only              1.25x     18.7x
+Sub-round pipeline              1.15x     21.5x
+Progressive DP check            1.10x     23.7x
+L2 Bloom filter                 1.20x     28.4x
+Unified batch inversion         1.12x     31.8x
+Adaptive DP threshold           1.05x     33.4x
+Hyper K=64 (optional)           1.18x     39.4x
+3-Kangaroo (K=0.90)            1.33x     52.4x
+Galbraith-Ruprai √6            2.45x     128.3x
 ```
 
 ## Testing Strategy
