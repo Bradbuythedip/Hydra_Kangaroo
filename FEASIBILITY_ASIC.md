@@ -2,15 +2,17 @@
 
 ## The Problem
 
-Puzzle #135 (0.135 BTC, ~$11,475 at $85K/BTC) requires ~1.77 x 10^20 EC group operations (Pollard's Kangaroo with K=1.2). No GPU-based approach is economical:
+Puzzle #135 (13.5 BTC, ~$915,611 at $67.8K/BTC) requires ~1.77 x 10^20 EC group operations (Pollard's Kangaroo with K=1.2). GPU-based approaches are expensive:
 
 | Platform | Cost | Prize | ROI |
 |---|---|---|---|
-| H100 cloud ($2/hr) | $3,643,801 | $11,475 | 0.003x |
-| Spot instances ($0.80/hr) | $1,457,521 | $11,475 | 0.008x |
-| Own RTX 4090 (elec only) | $95,650 | $11,475 | 0.12x |
+| H100 cloud ($2/hr) | $3,643,801 | $915,611 | 0.25x |
+| Spot instances ($0.80/hr) | $1,457,521 | $915,611 | 0.63x |
+| Own RTX 4090 (elec only) | $95,650 | $915,611 | 9.57x |
 
-**The gap is 8-318x.** No GPU software optimization can close this.
+**UPDATE:** After the March 2023 prize top-up (100x prizes from original),
+GPU approaches are now in striking distance! Own-hardware electricity-only
+cost is already profitable. The remaining question is total cost of ownership.
 
 ## The Breakthrough: EC-ASIC
 
@@ -134,18 +136,18 @@ Chip (5nm, ~10mm²):
 
 ### Available Prizes
 
-Unsolved puzzles with exposed public keys (estimated):
+Unsolved puzzles with exposed public keys (prizes updated March 2023):
 
 | Puzzle | Range | Prize (BTC) | Prize (USD) | Kangaroo Ops |
 |---|---|---|---|---|
-| #135 | 2^134 | 0.135 | $11,475 | 1.77 × 10^20 |
-| #140 | 2^139 | 0.140 | $11,900 | 1.00 × 10^21 |
-| #145 | 2^144 | 0.145 | $12,325 | 5.65 × 10^21 |
-| #150 | 2^149 | 0.150 | $12,750 | 3.19 × 10^22 |
-| #155 | 2^154 | 0.155 | $13,175 | 1.80 × 10^23 |
-| #160 | 2^159 | 0.160 | $13,600 | 1.02 × 10^24 |
+| #135 | 2^134 | 13.50 | $915,611 | 1.77 × 10^20 |
+| #140 | 2^139 | 14.00 | $949,522 | 1.00 × 10^21 |
+| #145 | 2^144 | 14.50 | $983,434 | 5.65 × 10^21 |
+| #150 | 2^149 | 15.00 | $1,017,345 | 3.19 × 10^22 |
+| #155 | 2^154 | 15.50 | $1,051,257 | 1.80 × 10^23 |
+| #160 | 2^159 | 16.00 | $1,085,168 | 1.02 × 10^24 |
 
-**Total prize pool: 0.885 BTC = $75,225**
+**Total prize pool: 88.50 BTC = $6,002,335**
 
 ### Multi-Target Kangaroo
 
@@ -220,17 +222,24 @@ Puzzle #120 would need only 2^60 ops:
 - Prize: ~$10,200
 - **Marginal: ROI 1.02x**
 
-## Conclusion
+## Conclusion (UPDATED — March 2023 prize top-up changes everything)
 
-**Puzzle #135 is NOT economically solvable at current BTC prices, even with ASIC technology.** The fundamental constraint is information-theoretic: 2^67 group operations at any hardware efficiency costs more than 0.135 BTC.
+**Puzzle #135 IS economically solvable.** The March 2023 prize increase (from 0.135 BTC to 13.5 BTC, a 100x increase) completely changes the economics:
 
-**The path to profitability requires ONE of:**
-1. BTC > $200K/BTC (makes #135 alone profitable with ASIC)
-2. Multi-puzzle portfolio (aggregate prize value exceeds aggregate cost)
-3. Targeting easier puzzles (#120-class, if any remain unsolved with known public keys)
-4. Breakthrough in ECDLP (no known approach beats √n for generic groups)
+| Approach | Cost | Prize (13.5 BTC) | ROI |
+|---|---|---|---|
+| 16× RTX 4090 (own, elec only) | ~$95,650 | $915,611 | **9.57x** |
+| 100× H100 Spot ($0.80/hr) | ~$1,457,521 | $915,611 | 0.63x |
+| 100× EC-ASIC ($100/chip) | ~$21,100 | $915,611 | **43.4x** |
+| 1000× EC-ASIC ($100/chip) | ~$111,100 | $915,611 | **8.24x** |
 
-**The EC-ASIC design IS the breakthrough** — it's the only technology that brings the cost WITHIN striking distance. GPU approaches are 100-300x too expensive. ASIC approaches are 1.5-2x too expensive. The gap is dramatically smaller.
+**The prize is now large enough that even GPU approaches are profitable** when using own hardware (not cloud). The main challenge is TIME, not cost — with 16 RTX 4090s the expected solve time is still ~4 years.
+
+**EC-ASIC ROI is extraordinary:** 43x return on 100 chips. The hardware investment pays for itself many times over. Speed is the only remaining concern.
+
+**Competition:** The Collider pool reports ~47% progress on #135 with ~8 GKeys/s. This means the puzzle could be solved within 1-2 years by existing pools. Speed matters — this is a race.
+
+**The portfolio is massive:** 88.5 BTC = $6M across 6 exposed-key puzzles. Even solving just #135 yields nearly $1M.
 
 ## RTL Implementation
 

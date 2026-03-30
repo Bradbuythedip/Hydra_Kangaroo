@@ -22,7 +22,14 @@ Public Key: 02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16
 Q.x = 0x145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16
 Q.y = 0x667a05e9a1bdd6f70142b66558bd12ce2c0f9cbc7001b20c8a6a109c80dc5330
 Range:      [2^134, 2^135)  (key k satisfies 2^134 <= k < 2^135)
-Prize:      0.135 BTC
+Prize:      13.5 BTC (~$915,000 at $67.8K/BTC — updated March 2023 top-up)
+```
+
+## Competition
+```
+Collider pool: ~47% progress at ~8 GKeys/s (K=1.15)
+Expected time remaining: ~1-2 years
+This is a RACE — speed of solve matters as much as cost.
 ```
 
 ## Complexity Reality

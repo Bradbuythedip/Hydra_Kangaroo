@@ -17,15 +17,17 @@ import sys
 # PUZZLE DATABASE
 # ═══════════════════════════════════════════════════════════════
 
-# Unsolved puzzles with known public keys (estimated)
-# Format: (puzzle_number, prize_btc, has_pubkey)
+# Unsolved puzzles with known public keys (exposed via 2019 transactions)
+# Prizes were increased ~10x in March 2023 top-up transaction.
+# Format: (prize_btc, has_pubkey)
+# Prize = puzzle_number / 10 BTC (e.g., #135 = 13.5 BTC)
 PUZZLES = {
-    135: (0.135, True),
-    140: (0.140, True),
-    145: (0.145, True),
-    150: (0.150, True),
-    155: (0.155, True),
-    160: (0.160, True),
+    135: (13.50, True),
+    140: (14.00, True),
+    145: (14.50, True),
+    150: (15.00, True),
+    155: (15.50, True),
+    160: (16.00, True),
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -139,7 +141,7 @@ def find_breakeven_btc(puzzle_num, hw_name, num_units, elec_rate=0.10):
     return 0
 
 def main():
-    btc_price = 85000
+    btc_price = 67823  # Approximate BTC price as of March 2026
     target_puzzle = 135
 
     # Parse args

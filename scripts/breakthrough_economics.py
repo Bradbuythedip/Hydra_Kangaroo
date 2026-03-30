@@ -90,13 +90,15 @@ HARDWARE = {
 # PUZZLE DATABASE
 # ═══════════════════════════════════════════════════════════════
 
+# Prize = puzzle_number / 10 BTC (increased ~10x in March 2023 top-up)
+# Public keys exposed via outgoing transactions on May 31, 2019
 PUZZLES = {
-    135: (0.135, True),
-    140: (0.140, True),
-    145: (0.145, True),
-    150: (0.150, True),
-    155: (0.155, True),
-    160: (0.160, True),
+    135: (13.50, True),
+    140: (14.00, True),
+    145: (14.50, True),
+    150: (15.00, True),
+    155: (15.50, True),
+    160: (16.00, True),
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -189,7 +191,7 @@ def solve_economics(puzzle_num, hw_name, num_units, btc_price,
     }
 
 def main():
-    btc_price = 107000  # Current approximate BTC price
+    btc_price = 67823  # BTC price as of March 30, 2026
     target_puzzle = 135
     num_gpus = 1
 
