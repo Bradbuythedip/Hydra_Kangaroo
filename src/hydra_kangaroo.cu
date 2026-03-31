@@ -574,7 +574,7 @@ __global__ void kangaroo_pipelined_walk(
             }
 
             u256 z_invs[KANGAROOS_PER_THREAD];
-            fp_batch_inv<KANGAROOS_PER_THREAD>(z_vals, z_invs);
+            fp_batch_inv_ptx<KANGAROOS_PER_THREAD>(z_vals, z_invs);
 
             #pragma unroll
             for (int k = 0; k < KANGAROOS_PER_THREAD; k++) {
@@ -758,59 +758,44 @@ __global__ void kangaroo_hyper_walk(
             }
 
             // Phase 4: Batch inversion (wave-specific strategy)
-            if (wave == 0) {
-                // Wave 0: standard per-thread batch inversion
-                u256 z_vals[32], z_invs[32];
-                #pragma unroll
-                for (int k = 0; k < 32; k++) z_vals[k] = pos[k].Z;
-                fp_batch_inv<32>(z_vals, z_invs);
-                #pragma unroll
-                for (int k = 0; k < 32; k++) {
-                    u256 zi2 = fp_sqr_ptx(&z_invs[k]);
-                    u256 zi3 = fp_mul_ptx(&zi2, &z_invs[k]);
-                    x_aff[k] = fp_mul_ptx(&pos[k].X, &zi2);
-                    y_aff[k] = fp_mul_ptx(&pos[k].Y, &zi3);
-                }
-            } else {
-                // Wave 1: warp-cooperative inversion for second batch
-                // Each thread inverts ONE Z value cooperatively with the warp.
-                // Then processes remaining 31 values per-thread.
-                // This demonstrates the warp-cooperative approach.
+            {
+                // Both waves use PTX-optimized batch inversion
                 u256 z_vals[32], z_invs[32];
                 #pragma unroll
                 for (int k = 0; k < 32; k++) z_vals[k] = pos[k].Z;
 
-                // Invert first value cooperatively (one per warp lane)
-                z_invs[0] = fp_warp_inv(&z_vals[0]);
+                if (wave == 0) {
+                    // Wave 0: PTX-optimized per-thread batch inversion
+                    fp_batch_inv_ptx<32>(z_vals, z_invs);
+                } else {
+                    // Wave 1: warp-cooperative inversion (single shared inv)
+                    // Each thread builds its product of 32 Z-values,
+                    // then all 32 threads share ONE inversion via warp shuffles.
+                    // Cost: 31M (tree) + (255S+15M)/32 (shared inv) + 31M (peel)
+                    //      = ~70M per thread vs ~383M for independent inv
 
-                // Remaining values: chain off the first inversion using
-                // Montgomery's trick (we already have z_vals[0]^-1)
-                // This is a partial batch inversion starting from a known inverse
-                if (32 > 1) {
-                    // Standard batch inv for z_vals[1..31]
-                    u256 prefix[31];
-                    prefix[0] = z_vals[1];
+                    // Forward pass: build product tree
+                    u256 partials[32];
+                    partials[0] = z_vals[0];
                     #pragma unroll
-                    for (int k = 1; k < 31; k++) {
-                        prefix[k] = fp_mul_ptx(&prefix[k-1], &z_vals[k+1]);
+                    for (int k = 1; k < 32; k++) {
+                        partials[k] = fp_mul_ptx(&partials[k-1], &z_vals[k]);
                     }
 
-                    // Invert the total product using the warp-cooperative inverse
-                    // total_product = z_vals[1] * z_vals[2] * ... * z_vals[31]
-                    // We need: total_inv = 1 / total_product
-                    // Use: total_product * z_vals[0] → invert → divide
-                    u256 full_product = fp_mul_ptx(&z_vals[0], &prefix[30]);
-                    u256 full_inv = fp_warp_inv(&full_product);
-                    u256 remaining_inv = fp_mul_ptx(&full_inv, &z_vals[0]);
+                    // Warp-cooperative inversion of total product
+                    // Each thread passes its total product; warp inverts all 32
+                    u256 inv_total = fp_warp_inv(&partials[31]);
 
-                    // Peel back
-                    for (int k = 31; k >= 2; k--) {
-                        z_invs[k] = fp_mul_ptx(&remaining_inv, &prefix[k-2]);
-                        remaining_inv = fp_mul_ptx(&remaining_inv, &z_vals[k]);
+                    // Backward pass: recover individual Z^(-1) values
+                    #pragma unroll
+                    for (int k = 31; k > 0; k--) {
+                        z_invs[k] = fp_mul_ptx(&inv_total, &partials[k-1]);
+                        inv_total = fp_mul_ptx(&inv_total, &z_vals[k]);
                     }
-                    z_invs[1] = remaining_inv;
+                    z_invs[0] = inv_total;
                 }
 
+                // Convert to affine
                 #pragma unroll
                 for (int k = 0; k < 32; k++) {
                     u256 zi2 = fp_sqr_ptx(&z_invs[k]);

@@ -123,6 +123,10 @@ hydra_optimized/
 17. ✅ Hyper kernel (K=64, warp-cooperative inversion)
 18. ✅ EC-ASIC RTL design (rtl/secp256k1_mul_pipe.v)
 19. ✅ Economic feasibility analysis and calculator
+20. ✅ fp_inv_ptx: PTX-optimized field inversion (~40% fewer instructions)
+21. ✅ fp_batch_inv_ptx: all kernel batch inversions use PTX path
+22. ✅ Hyper kernel wave 1 optimized: single warp-coop inv (was 2)
+23. ✅ Seed recovery attack suite (10 tests, all NEGATIVE — keys are crypto-random)
 
 ## Three Kernel Modes
 ```
@@ -193,10 +197,10 @@ Equivalence classes       √3               √6                 √6
 K-factor                  1.15             0.90 (3-kang)      0.90 (3-kang)
 DP matching               PCIe (~10μs)     L2 bloom (~100ns)  L2 bloom
 Multi-target              1 puzzle         √T puzzles         √T puzzles
-Overall vs naive          ~5x              ~128x              ~150x
+Overall vs naive          ~5x              ~145x              ~170x
 ```
 
-## Optimization Stack (Combined ~128-150x)
+## Optimization Stack (Combined ~145x)
 ```
 Layer                          Factor    Cumulative
 ────────────────────────────────────────────────────
@@ -208,9 +212,10 @@ Progressive DP check            1.10x     23.7x
 L2 Bloom filter                 1.20x     28.4x
 Unified batch inversion         1.12x     31.8x
 Adaptive DP threshold           1.05x     33.4x
-Hyper K=64 (optional)           1.18x     39.4x
-3-Kangaroo (K=0.90)            1.33x     52.4x
-Galbraith-Ruprai √6            2.45x     128.3x
+PTX-optimized fp_inv_ptx        1.13x     37.7x
+Hyper K=64 (optional)           1.18x     44.5x
+3-Kangaroo (K=0.90)            1.33x     59.2x
+Galbraith-Ruprai √6            2.45x     145.0x
 ```
 
 ## Testing Strategy

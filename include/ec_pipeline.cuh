@@ -82,7 +82,7 @@ void ec_batch_to_xonly(const JacobianPoint *points, u256 *x_out) {
 // This is the on-demand computation, called for ~1 in 2^25 points
 __device__
 AffinePoint ec_recover_affine(const JacobianPoint *p) {
-    u256 z_inv = fp_inv(&p->Z);
+    u256 z_inv = fp_inv_ptx(&p->Z);
     u256 zi2 = fp_sqr_ptx(&z_inv);
     u256 zi3 = fp_mul_ptx(&zi2, &z_inv);
     AffinePoint r;
@@ -324,8 +324,8 @@ void ec_batch_to_xonly_ptx(const JacobianPoint *points, u256 *x_out) {
         partials[i] = fp_mul_ptx(&partials[i-1], &z_vals[i]);
     }
 
-    // Single inversion of total product
-    u256 inv_total = fp_inv(&partials[K-1]);
+    // Single inversion of total product (PTX-optimized: ~40% fewer instructions)
+    u256 inv_total = fp_inv_ptx(&partials[K-1]);
 
     // Backward pass: recover individual Z^(-1) values
     u256 z_invs[K];

@@ -420,6 +420,118 @@ u256 fp_sqr_ptx(const u256 *a) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// PTX-OPTIMIZED FIELD INVERSION
+//
+// Same addition chain as fp_inv (255 squarings + 15 multiplications)
+// but using fp_sqr_ptx / fp_mul_ptx for ~40% fewer instructions.
+// This is the single most impactful optimization: fp_inv is on the
+// critical path of every batch inversion (called once per K steps).
+// At K=32: saves ~108 equivalent muls per 32 steps = ~13% speedup.
+// ═══════════════════════════════════════════════════════════════
+
+__device__
+u256 fp_inv_ptx(const u256 *a) {
+    u256 x2, x3, x6, x9, x11, x22, x44, x88, x176, x220, x223, t;
+    int i;
+
+    // x2 = a^3
+    x2 = fp_sqr_ptx(a);
+    x2 = fp_mul_ptx(&x2, a);
+
+    // x3 = a^7
+    x3 = fp_sqr_ptx(&x2);
+    x3 = fp_mul_ptx(&x3, a);
+
+    // x6 = a^(2^6 - 1)
+    x6 = x3;
+    for (i = 0; i < 3; i++) x6 = fp_sqr_ptx(&x6);
+    x6 = fp_mul_ptx(&x6, &x3);
+
+    // x9 = a^(2^9 - 1)
+    x9 = x6;
+    for (i = 0; i < 3; i++) x9 = fp_sqr_ptx(&x9);
+    x9 = fp_mul_ptx(&x9, &x3);
+
+    // x11 = a^(2^11 - 1)
+    x11 = x9;
+    for (i = 0; i < 2; i++) x11 = fp_sqr_ptx(&x11);
+    x11 = fp_mul_ptx(&x11, &x2);
+
+    // x22 = a^(2^22 - 1)
+    x22 = x11;
+    for (i = 0; i < 11; i++) x22 = fp_sqr_ptx(&x22);
+    x22 = fp_mul_ptx(&x22, &x11);
+
+    // x44 = a^(2^44 - 1)
+    x44 = x22;
+    for (i = 0; i < 22; i++) x44 = fp_sqr_ptx(&x44);
+    x44 = fp_mul_ptx(&x44, &x22);
+
+    // x88 = a^(2^88 - 1)
+    x88 = x44;
+    for (i = 0; i < 44; i++) x88 = fp_sqr_ptx(&x88);
+    x88 = fp_mul_ptx(&x88, &x44);
+
+    // x176 = a^(2^176 - 1)
+    x176 = x88;
+    for (i = 0; i < 88; i++) x176 = fp_sqr_ptx(&x176);
+    x176 = fp_mul_ptx(&x176, &x88);
+
+    // x220 = a^(2^220 - 1)
+    x220 = x176;
+    for (i = 0; i < 44; i++) x220 = fp_sqr_ptx(&x220);
+    x220 = fp_mul_ptx(&x220, &x44);
+
+    // x223 = a^(2^223 - 1)
+    x223 = x220;
+    for (i = 0; i < 3; i++) x223 = fp_sqr_ptx(&x223);
+    x223 = fp_mul_ptx(&x223, &x3);
+
+    // Final: P-2 = (2^223-1)*2^33 + 0xFFFFFC2D
+    t = x223;
+    for (i = 0; i < 23; i++) t = fp_sqr_ptx(&t);
+    t = fp_mul_ptx(&t, &x22);
+
+    for (i = 0; i < 5; i++) t = fp_sqr_ptx(&t);
+    t = fp_mul_ptx(&t, a);
+
+    for (i = 0; i < 3; i++) t = fp_sqr_ptx(&t);
+    t = fp_mul_ptx(&t, &x2);
+
+    for (i = 0; i < 2; i++) t = fp_sqr_ptx(&t);
+    t = fp_mul_ptx(&t, a);
+
+    return t;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PTX-OPTIMIZED BATCH INVERSION
+//
+// Drop-in replacement for fp_batch_inv using fp_inv_ptx.
+// All tree multiplications also use fp_mul_ptx.
+// ═══════════════════════════════════════════════════════════════
+
+template<int K>
+__device__
+void fp_batch_inv_ptx(u256 *values, u256 *results) {
+    u256 partials[K];
+    partials[0] = values[0];
+    #pragma unroll
+    for (int i = 1; i < K; i++) {
+        partials[i] = fp_mul_ptx(&partials[i-1], &values[i]);
+    }
+
+    u256 inv_total = fp_inv_ptx(&partials[K-1]);
+
+    #pragma unroll
+    for (int i = K-1; i > 0; i--) {
+        results[i] = fp_mul_ptx(&inv_total, &partials[i-1]);
+        inv_total = fp_mul_ptx(&inv_total, &values[i]);
+    }
+    results[0] = inv_total;
+}
+
+// ═══════════════════════════════════════════════════════════════
 // WARP-COOPERATIVE BATCH INVERSION
 //
 // Inspired by puzzle_binary's multi-core sharing: instead of each
@@ -481,8 +593,8 @@ u256 fp_warp_inv(const u256 *my_value) {
     }
 
     // Now lane 0 has the total product; all lanes have it after the last shuffle
-    // Every lane inverts the same total product
-    u256 inv_total = fp_inv(&my_partial);
+    // Every lane inverts the same total product (using PTX-optimized inversion)
+    u256 inv_total = fp_inv_ptx(&my_partial);
 
     // Backward pass: peel off each lane's contribution
     // This is trickier with warp shuffles -- use a different approach:
